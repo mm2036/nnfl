@@ -1,0 +1,1169 @@
+#!/usr/bin/env python3
+"""
+Final merged workbook script with betsheet merge added.
+
+This file is the user's script with the betsheet merge block injected at the end
+of main() and a small duplicate-return cleanup.
+"""
+from __future__ import annotations
+
+import argparse
+import re, subprocess
+from io import StringIO
+from pathlib import Path
+import shutil
+import pandas as pd
+from bs4 import BeautifulSoup
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from copy import copy
+
+UA = "Mozilla/5.0 (compatible; PFR-OneGrab/1.0)"
+
+# ---------- columns / aliases ----------
+PASSING_COLS_OFF = ["Tm","Cmp","Att","Cmp%","Yds","TD","Int","Y/A","Rate","Sk","4QC","GWD"]
+RUSHING_COLS_OFF = ["Tm","Att","Yds","TD","Y/A","Fmb"]
+TOTAL_OFF_COLS   = ["Tm","total_yards","Y/P","PF","plays_per_drive","yards_per_drive","time_avg","points_average"]
+
+PASSING_ALIASES_OFF = {
+    "Tm":["Tm","Team","Team Name"],
+    "Cmp":["Cmp","pass_cmp","Cmp."],
+    "Att":["Att","pass_att"],
+    "Cmp%":["Cmp%","Cmp.%","Cmp%."],
+    "Yds":["Yds","Pass Yds","Yds."],
+    "TD":["TD","Pass TD"],
+    "Int":["Int","Int."],
+    "Y/A":["Y/A","Yds/Att","Yds/Att."],
+    "Rate":["Rate","Passer Rating","QB Rate","QBRate","Rate."],
+    "Sk":["Sk","Sacks","Sk."],
+    "4QC":["4QC","4th Quarter Comebacks"],
+    "GWD":["GWD","Game-Winning Drives"],
+}
+RUSHING_ALIASES_OFF = {
+    "Tm":["Tm","Team","Team Name"],
+    "Att":["Att","Rush Att","Att.","Rsh Att"],
+    "Yds":["Yds","Rush Yds","Yds."],
+    "TD":["TD","Rush TD"],
+    "Y/A":["Y/A","Yds/Att","Rush Y/A","Rsh Y/A","Rush Yds/Att"],
+    "Fmb":["Fmb","Fumbles","Fum","Fmb."],
+}
+
+PASSING_COLS_DEF = ["Tm","Cmp","Att","Cmp%","Yds","TD","Int","Y/A","Rate","Sk","QBHits"]
+RUSHING_COLS_DEF = ["Tm","Att","Yds","TD","Y/A","Y/G"]
+TOTAL_DEF_COLS   = ["Tm","total_yards","Y/P","PF","plays_per_drive","yards_per_drive","time_avg","points_average"]
+
+PASSING_ALIASES_DEF = {
+    "Tm":["Tm","Team","Team Name"],
+    "Cmp":["Cmp","pass_cmp","Cmp."],
+    "Att":["Att","pass_att"],
+    "Cmp%":["Cmp%","Cmp.%","Cmp%."],
+    "Yds":["Yds","pass_yds","Pass Yds","Yds."],
+    "TD":["TD","pass_td"],
+    "Int":["Int","pass_int","Int."],
+    "Rate":["Rate","Passer Rating","QB Rate","QBRate","Rate."],
+    "Y/A":["Y/A","pass_adj_net_yds_per_att","Yds/Att","Yds/Att."],
+    "Sk":["Sk","pass_sacked","Sacks","Sk."],
+    "QBHits":["QBHits","QB Hits","QB Hits.","qb_hits"],
+}
+RUSHING_ALIASES_DEF = {
+    "Tm":["Tm","Team","Team Name"],
+    "Att":["Att","rush_att","Rsh Att","Att."],
+    "Yds":["Yds","rush_yds","Yds."],
+    "TD":["TD","rush_td"],
+    "Y/A":["Y/A","rush_yds_per_att","Rush Y/A","Yds/Att"],
+    "Y/G":["Y/G","rush_yds_per_g","Yds/G"],
+}
+
+SUMMARY_KEYS = {"avg team","avg tm/g","average team","average tm/g","league average"}
+
+# spacer sets
+PASSING_SPACER_HEADERS_OFF = ["Cmp%","Yds","TD","Int","Y/A","Rate","Sk","4QC","GWD"]
+RUSHING_SPACER_HEADERS_OFF = ["Yds","TD","Y/A","Fmb"]
+TOTAL_SPACER_HEADERS       = ["total_yards","Y/P","PF","plays_per_drive","yards_per_drive","time_avg","points_average"]
+PASSING_SPACER_HEADERS_DEF = ["Cmp%","Yds","TD","Int","Y/A","Rate","Sk","QBHits"]
+RUSHING_SPACER_HEADERS_DEF = ["Yds","TD","Y/A"]
+
+# ---------- utils ----------
+def wget_or_requests(url: str, target: Path):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(["wget","-q",f"--user-agent={UA}","-O",str(target),url], check=True)
+    except Exception:
+        import requests
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
+        r.raise_for_status()
+        target.write_text(r.text, encoding="utf-8")
+
+def uncomment_tables(html: str) -> str:
+    return re.sub(r"<!--(.*?)-->", lambda m: m.group(1) if "<table" in m.group(1).lower() else m.group(0), html, flags=re.S|re.I)
+
+def flatten_cols(cols):
+    return [" ".join([str(x) for x in c if str(x)!=""]) if isinstance(c,tuple) else str(c) for c in cols]
+
+def read_table(table_tag, header=0):
+    df = pd.read_html(StringIO(str(table_tag)), header=header)[0]
+    df.columns = flatten_cols(df.columns)
+    return df
+
+def _norm_team_key(s: str) -> str:
+    s = (s or "").replace("\u00A0", " ")
+    s = re.sub(r"[*+]", "", s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    s = s.replace(".", "")
+    s = re.sub(r"\btm\s*/\s*g\b", "tm/g", s)
+    return s
+
+def normalize_headers(df: pd.DataFrame, desired: list[str], aliases: dict) -> pd.DataFrame:
+    if "Rk" in df.columns:
+        df = df[df["Rk"] != "Rk"]
+    colmap = {}
+    for want, alts in aliases.items():
+        for a in alts:
+            if a in df.columns:
+                colmap[a] = want
+                break
+    df = df.rename(columns=colmap)
+    for c in desired:
+        if c not in df.columns:
+            df[c] = pd.NA
+    if "Tm" in df.columns:
+        df = df[df["Tm"].notna()]
+        df["Tm"] = (df["Tm"].astype(str)
+                    .str.replace("\u00A0", " ", regex=False)
+                    .str.replace(r"[*+]", "", regex=True)
+                    .str.replace(r"\s+", " ", regex=True)
+                    .str.strip())
+        df = df[~df["Tm"].map(lambda x: _norm_team_key(x) in SUMMARY_KEYS)]
+        df = df[~df["Tm"].str.contains(r"League|Avg\s+Tm/G|Avg\s+Team", case=False, na=False)]
+    df = df[desired]
+    for c in desired:
+        if c != "Tm":
+            df[c] = df[c].astype(str).str.rstrip('%')
+            df[c] = pd.to_numeric(df[c].replace({"": pd.NA}), errors="coerce")
+    return df.reset_index(drop=True)
+
+def _to_num(x):
+    if x is None or x == "":
+        return pd.NA
+    try:
+        return float(str(x).replace(",",""))
+    except Exception:
+        return pd.to_numeric(x, errors="coerce")
+
+def _to_secs(s):
+    if s is None or s == "":
+        return pd.NA
+    m = re.match(r"^\s*(\d+):(\d{2})\s*$", s)
+    if m:
+        return int(m.group(1))*60 + int(m.group(2))
+    try:
+        return float(s)
+    except Exception:
+        return pd.NA
+
+def sort_workbook_inplace(path: Path):
+    # sort all sheets by first column; fill numeric NaN with 0
+    book = pd.read_excel(path, sheet_name=None)
+    with pd.ExcelWriter(path, engine="xlsxwriter") as w:
+        for name, df in book.items():
+            if df.shape[1] == 0:
+                df.to_excel(w, index=False, sheet_name=name); continue
+            first = df.columns[0]
+            if df[first].dtype == object:
+                df[first] = df[first].astype(str).str.strip()
+            df = df.sort_values(by=first, ascending=True, kind="mergesort", na_position="last").reset_index(drop=True)
+            num = df.select_dtypes(include="number").columns
+            df[num] = df[num].fillna(0)
+            df.to_excel(w, index=False, sheet_name=name)
+
+# ---------- openpyxl helpers ----------
+def _norm_header_key(s: str) -> str:
+    s = (s or "").replace("\u00A0"," ")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    s = s.replace(".", "")
+    return s
+
+def _insert_blanks(ws, headers, header_row=1):
+    # map current header -> col idx
+    idx = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=header_row, column=c).value
+        if isinstance(v, str):
+            idx[_norm_header_key(v)] = c
+    cols = [idx[_norm_header_key(h)] for h in headers if _norm_header_key(h) in idx]
+    for col in sorted(set(cols), reverse=True):
+        ws.insert_cols(col + 1, amount=1)
+
+def _delete_rows(ws, start, amount):
+    if ws.max_row >= start:
+        ws.delete_rows(start, amount=amount)
+
+# ---------- parsing ----------
+def parse_offense(off_visible: str):
+    soup = BeautifulSoup(off_visible, "lxml")
+
+    t = soup.select_one("#div_passing table")
+    if not t: raise RuntimeError("offense passing table not found")
+    passing = normalize_headers(read_table(t), PASSING_COLS_OFF, PASSING_ALIASES_OFF)
+
+    t = soup.select_one("#div_rushing table")
+    if not t: raise RuntimeError("offense rushing table not found")
+    rushing = normalize_headers(read_table(t), RUSHING_COLS_OFF, RUSHING_ALIASES_OFF)
+
+    body = soup.select_one("#div_team_stats tbody")
+    if not body: raise RuntimeError("offense team_stats tbody not found")
+    total, tur, pen = [], [], []
+    for tr in body.find_all("tr"):
+        if tr.get("class") and "thead" in tr["class"]: continue
+        row = {c["data-stat"]: c.get_text(strip=True) for c in tr.find_all(["th","td"])}
+        tm = row.get("team")
+        if not tm or "Total" in tm: continue
+        tm = re.sub(r"[*+]","",tm)
+        total.append({
+            "Tm": tm,
+            "total_yards": _to_num(row.get("total_yards")),
+            "yards_per_play_offense": _to_num(row.get("yds_per_play_offense")),
+            "points_for": _to_num(row.get("points")),
+        })
+        tur.append({"Tm": tm, "turnovers": _to_num(row.get("turnovers"))})
+        pen.append({"Tm": tm, "penalties": _to_num(row.get("penalties")), "penalty_yards": _to_num(row.get("penalties_yds"))})
+
+    total_off = pd.DataFrame(total)[["Tm","total_yards","yards_per_play_offense","points_for"]]
+    turnovers = pd.DataFrame(tur)[["Tm","turnovers"]]
+    penalties = pd.DataFrame(pen)[["Tm","penalties","penalty_yards"]]
+
+    body = soup.select_one("#div_drives tbody")
+    if not body: raise RuntimeError("offense drives tbody not found")
+    rows=[]
+    for tr in body.find_all("tr"):
+        if tr.get("class") and "thead" in tr["class"]: continue
+        row = {c["data-stat"]: c.get_text(strip=True) for c in tr.find_all(["th","td"])}
+        tm=row.get("team")
+        if not tm or "Total" in tm: continue
+        tm=re.sub(r"[*+]","",tm)
+        rows.append({
+            "Tm": tm,
+            "plays_per_drive": _to_num(row.get("plays_per_drive")),
+            "yards_per_drive": _to_num(row.get("yds_per_drive")),
+            "time_avg": _to_secs(row.get("time_avg")),
+            "points_average": _to_num(row.get("points_avg")),
+        })
+    drives = pd.DataFrame(rows)[["Tm","plays_per_drive","yards_per_drive","time_avg","points_average"]]
+
+    total_off_df = pd.merge(total_off, drives, on="Tm", how="left")
+    total_off_df["Y/P"] = total_off_df.pop("yards_per_play_offense")
+    total_off_df["PF"]  = total_off_df.pop("points_for")
+    total_off_df = total_off_df[[c for c in TOTAL_OFF_COLS if c in total_off_df.columns]]
+
+    # numeric NaNs -> 0
+    for df in (passing, rushing, total_off_df, turnovers, penalties):
+        num = df.select_dtypes(include="number").columns
+        df[num] = df[num].fillna(0)
+
+    return passing, rushing, total_off_df, turnovers, penalties
+
+def parse_defense(def_visible: str):
+    soup = BeautifulSoup(def_visible, "lxml")
+
+    t = soup.select_one("#div_passing table")
+    if not t: raise RuntimeError("defense passing table not found")
+    passing = normalize_headers(read_table(t), PASSING_COLS_DEF, PASSING_ALIASES_DEF)
+
+    t = soup.select_one("#div_rushing table")
+    if not t: raise RuntimeError("defense rushing table not found")
+    rushing = normalize_headers(read_table(t), RUSHING_COLS_DEF, RUSHING_ALIASES_DEF)
+
+    body = soup.select_one("#div_team_stats tbody")
+    if not body: raise RuntimeError("defense team_stats tbody not found")
+    total, tur, pen = [], [], []
+    for tr in body.find_all("tr"):
+        if tr.get("class") and "thead" in tr["class"]: continue
+        row = {c["data-stat"]: c.get_text(strip=True) for c in tr.find_all(["th","td"])}
+        tm = row.get("team")
+        if not tm or "Total" in tm: continue
+        tm = re.sub(r"[*+]","",tm)
+        ypp = _to_num(row.get("yds_per_play_offense"))
+        if pd.isna(ypp): ypp = _to_num(row.get("yds_per_play_defense"))
+        if pd.isna(ypp): ypp = _to_num(row.get("yds_per_play"))
+        total.append({"Tm": tm, "total_yards": _to_num(row.get("total_yards")), "ypp_raw": ypp, "points_for": _to_num(row.get("points"))})
+        tur.append({"Tm": tm, "turnovers": _to_num(row.get("turnovers"))})
+        pen.append({"Tm": tm, "penalties": _to_num(row.get("penalties")), "penalty_yards": _to_num(row.get("penalties_yds"))})
+
+    total_def = pd.DataFrame(total)[["Tm","total_yards","ypp_raw","points_for"]]
+    turnovers = pd.DataFrame(tur)[["Tm","turnovers"]]
+    penalties = pd.DataFrame(pen)[["Tm","penalties","penalty_yards"]]
+
+    body = soup.select_one("#div_drives tbody")
+    if not body: raise RuntimeError("defense drives tbody not found")
+    rows=[]
+    for tr in body.find_all("tr"):
+        if tr.get("class") and "thead" in tr["class"]: continue
+        row = {c["data-stat"]: c.get_text(strip=True) for c in tr.find_all(["th","td"])}
+        tm=row.get("team")
+        if not tm or "Total" in tm: continue
+        tm=re.sub(r"[*+]","",tm)
+        rows.append({
+            "Tm": tm,
+            "plays_per_drive": _to_num(row.get("plays_per_drive")),
+            "yards_per_drive": _to_num(row.get("yds_per_drive")),
+            "time_avg": _to_secs(row.get("time_avg")),
+            "points_average": _to_num(row.get("points_avg")),
+        })
+    drives = pd.DataFrame(rows)[["Tm","plays_per_drive","yards_per_drive","time_avg","points_average"]]
+
+    total_def_df = pd.merge(total_def, drives, on="Tm", how="left")
+    total_def_df["Y/P"] = total_def_df.pop("ypp_raw")
+    total_def_df["PF"]  = total_def_df.pop("points_for")
+    total_def_df = total_def_df[[c for c in TOTAL_DEF_COLS if c in total_def_df.columns]]
+
+    # numeric NaNs -> 0
+    for df in (passing, rushing, total_def_df, turnovers, penalties):
+        num = df.select_dtypes(include="number").columns
+        df[num] = df[num].fillna(0)
+
+    return passing, rushing, total_def_df, turnovers, penalties
+
+# ---------- formatters against the single workbook ----------
+def after_write_formatting(all_path: Path, def_turn_map: dict, def_pen_map: dict):
+    wb = load_workbook(all_path)
+
+    def _sheet(name: str):
+        return wb[name] if name in wb.sheetnames else None
+
+    # offense
+    ws = _sheet("passing")
+    if ws:
+        _insert_blanks(ws, PASSING_SPACER_HEADERS_OFF)
+
+    ws = _sheet("rushing")
+    if ws:
+        _insert_blanks(ws, RUSHING_SPACER_HEADERS_OFF)
+
+    ws = _sheet("total_off")
+    if ws:
+        _insert_blanks(ws, TOTAL_SPACER_HEADERS)
+
+    # turnovers (off): blank after turnovers; add Takeaways; Column E = DEF_Turnovers; blank after E
+    ws = _sheet("turnovers")
+    if ws:
+        # 🔹 Remove any old "Takeaways" or blank columns from prior runs
+        for col_idx in reversed(range(1, ws.max_column + 1)):
+            header = str(ws.cell(row=1, column=col_idx).value or "").strip().lower()
+            if header in ("blank", "blank1", "blank2", "def_turnovers") or header.endswith("_blank"):
+                ws.delete_cols(col_idx)
+
+        # 🔹 Locate 'turnovers' column dynamically
+        turn_idx = None
+        for c in range(1, ws.max_column + 1):
+            v = str(ws.cell(row=1, column=c).value or "").strip().lower()
+            if v == "turnovers":
+                turn_idx = c
+                break
+        if turn_idx is None:
+            return  # no turnovers column found
+
+        # ✅ Build exact order:
+        # turnovers | blank | DEF_Turnovers | blank | Takeaways | blank
+
+        # 1️⃣ blank after turnovers (C → D)
+        ws.insert_cols(turn_idx + 1)
+
+        # 2️⃣ DEF_Turnovers (E)
+        ws.insert_cols(turn_idx + 2)
+        ws.cell(row=1, column=turn_idx + 2).value = "DEF_Turnovers"
+
+        # 3️⃣ blank after DEF_Turnovers (F)
+        ws.insert_cols(turn_idx + 3)
+
+
+        # 5️⃣ blank after Takeaways (H)
+        ws.insert_cols(turn_idx + 5)
+
+        # 🔹 Fill DEF_Turnovers and Takeaways values from def_turn_map
+        for r in range(2, ws.max_row + 1):
+            tm = ws.cell(row=r, column=1).value
+            tm = (str(tm).replace("\u00A0", " ").replace("*", "").replace("+", "").strip()) if tm else ""
+            val = def_turn_map.get(tm, 0)
+            ws.cell(row=r, column=turn_idx + 2).value = val   # DEF_Turnovers
+
+
+    ws = _sheet("penalties")
+    if ws:
+        # Remove any existing blank columns
+        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+        for col_idx in reversed(range(1, ws.max_column + 1)):
+            v = str(ws.cell(row=1, column=col_idx).value or "").lower()
+            if v.startswith("blank") or v.endswith("_blank"):
+                ws.delete_cols(col_idx)
+
+        # Insert blanks and DEF columns in correct order:
+        # penalties, blank, penalty_yards, blank, DEF_penalties, blank, DEF_penalty_yards, blank
+
+        # Ensure we start fresh with penalties at col C
+        pen_idx = None
+        for c in range(1, ws.max_column + 1):
+            v = str(ws.cell(row=1, column=c).value or "").strip().lower()
+            if v == "penalties":
+                pen_idx = c
+                break
+        if pen_idx is None:
+            return  # no penalties column found
+
+        # 1️⃣ blank after penalties (D)
+        ws.insert_cols(pen_idx + 1)
+
+        # 2️⃣ penalty_yards (E) already exists or will be next col — ensure it’s named correctly
+        if ws.cell(row=1, column=pen_idx + 2).value is None:
+           ws.cell(row=1, column=pen_idx + 2).value = "penalty_yards"
+
+        # 3️⃣ blank after penalty_yards (F)
+        ws.insert_cols(pen_idx + 3)
+
+        # 4️⃣ DEF_penalties (G)
+        ws.insert_cols(pen_idx + 4)
+        ws.cell(row=1, column=pen_idx + 4).value = "DEF_penalties"
+
+        # 5️⃣ blank after DEF_penalties (H)
+        ws.insert_cols(pen_idx + 5)
+
+        # 6️⃣ DEF_penalty_yards (I)
+        ws.insert_cols(pen_idx + 6)
+        ws.cell(row=1, column=pen_idx + 6).value = "DEF_penalty_yards"
+
+        # 7️⃣ blank after DEF_penalty_yards (J)
+        ws.insert_cols(pen_idx + 7)
+
+        # Fill DEF columns using def_pen_map
+        for r in range(2, ws.max_row + 1):
+            tm = ws.cell(row=r, column=1).value
+            tm = (str(tm).replace("\u00A0", " ").replace("*", "").replace("+", "").strip()) if tm else ""
+            val = def_pen_map.get(tm, 0)
+            ws.cell(row=r, column=pen_idx + 4).value = val   # DEF_penalties (G)
+            ws.cell(row=r, column=pen_idx + 6).value = val   # DEF_penalty_yards (I)
+
+
+
+    # defense sheets (renamed *_d)
+    ws = _sheet("passing_d")
+    if ws:
+        _insert_blanks(ws, PASSING_SPACER_HEADERS_DEF)
+
+    ws = _sheet("rushing_d")
+    if ws:
+        _insert_blanks(ws, RUSHING_SPACER_HEADERS_DEF)
+
+    ws = _sheet("total_d")
+    if ws:
+        _insert_blanks(ws, TOTAL_SPACER_HEADERS)
+
+    wb.save(all_path); wb.close()
+
+
+def add_rank_formulas(path, sheet_name, high_cols=None, low_cols=None):
+    """
+    Fill *existing blank columns* (e.g., inserted spacers) with =RANK() formulas
+    based on the stat column immediately to their left.
+    Keeps all stats intact.
+    """
+    high_cols = high_cols or []
+    low_cols = low_cols or []
+
+    wb = load_workbook(path)
+    if sheet_name not in wb.sheetnames:
+        wb.close()
+        return
+
+    ws = wb[sheet_name]
+    max_row = ws.max_row
+    max_col = ws.max_column
+
+
+    for c in range(2, max_col + 1):
+        header = str(ws.cell(row=1, column=c).value or "").strip()
+        if not header or "blank" in header.lower():
+            left_header = str(ws.cell(row=1, column=c - 1).value or "").strip()
+            left_letter = get_column_letter(c - 1)
+            # Determine rank direction
+            if left_header in high_cols:
+                order = 0  # high is good
+            elif left_header in low_cols:
+                order = 1  # low is good
+            else:
+                continue
+            # Fill rank formulas
+            for r in range(2, max_row + 1):
+                ws.cell(row=r, column=c).value = f"=RANK({left_letter}{r},{left_letter}$2:{left_letter}${max_row},{order})"
+
+    wb.save(path)
+    wb.close()
+
+# ---------- main ----------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--year", type=int, default=25)
+    ap.add_argument("--week", type=int, default=9)
+    args = ap.parse_args()
+
+    from pathlib import Path
+    import shutil
+
+    season_year = 2000 + args.year if args.year < 100 else args.year
+    y2 = f"{args.year:02d}"
+
+    # 🧩 Create top-level folder for this run
+    base_folder = Path(f"NFL_{args.year}_{args.week}")
+    src = base_folder / "src"
+    data = base_folder / "data"
+
+    # make directories
+    src.mkdir(parents=True, exist_ok=True)
+    data.mkdir(parents=True, exist_ok=True)
+
+    # 🧩 Use run-specific src/data paths
+    off_html = src / f"week{args.week}-off{y2}.htm"
+    def_html = src / f"week{args.week}-opp{y2}.htm"
+    out_path = data / f"week{args.week}-all{y2}.xlsx"
+
+
+#    src = Path("src"); data = Path("data"); data.mkdir(parents=True, exist_ok=True)
+    off_html = src / f"week{args.week}-off{y2}.htm"
+    def_html = src / f"week{args.week}-opp{y2}.htm"
+    wget_or_requests(f"https://www.pro-football-reference.com/years/{season_year}/", off_html)
+    wget_or_requests(f"https://www.pro-football-reference.com/years/{season_year}/opp.htm", def_html)
+
+    # parse both
+    off_visible = uncomment_tables(off_html.read_text(encoding="utf-8"))
+    def_visible = uncomment_tables(def_html.read_text(encoding="utf-8"))
+
+    off_pass, off_rush, off_total, off_turn, off_pen = parse_offense(off_visible)
+    def_pass, def_rush, def_total, def_turn, def_pen = parse_defense(def_visible)
+
+    # build maps for post-write injection
+    def_turn_map = {str(k).strip(): (0 if pd.isna(v) else float(v)) for k, v in zip(def_turn["Tm"], def_turn["turnovers"])}
+    def_pen_map  = {str(k).strip(): (0 if pd.isna(v) else float(v)) for k, v in zip(def_pen["Tm"],  def_pen["penalties"])}
+
+    # write ONE workbook with 8 sheets in the exact order requested
+    out_path = data / f"week{args.week}-all{y2}.xlsx"
+    with pd.ExcelWriter(out_path, engine="openpyxl", mode="w") as w:
+        off_pass.to_excel(w, sheet_name="passing", index=False)
+        off_rush.to_excel(w, sheet_name="rushing", index=False)
+        off_total.to_excel(w, sheet_name="total_off", index=False)
+        off_turn.to_excel(w, sheet_name="turnovers", index=False)
+        off_pen.to_excel(w, sheet_name="penalties", index=False)
+        def_pass.to_excel(w, sheet_name="passing_d", index=False)
+        def_rush.to_excel(w, sheet_name="rushing_d", index=False)
+        def_total.to_excel(w, sheet_name="total_d", index=False)
+
+    wb = load_workbook(out_path)
+    wb.properties.title = f"all{y2}-{args.week}"
+    wb.save(out_path)
+
+    # sort before formatting so spacers persist
+    sort_workbook_inplace(out_path)
+
+    print("🧩 applying lightweight formatting in pandas...")
+
+    import numpy as np
+
+    book = pd.read_excel(out_path, sheet_name=None)
+    def remove_avg_rows(df):
+        """Remove only 'Avg Team' and 'Avg Tm/G' rows safely — never real teams."""
+        if "Tm" not in df.columns:
+            return df
+        mask = df["Tm"].astype(str).str.contains(r"avg|average|league", case=False, na=False)
+        return df.loc[~mask].reset_index(drop=True)
+
+    def add_blank_cols(df, headers):
+        """Insert blank spacer columns after specific headers."""
+        for h in headers:
+            if h in df.columns:
+                idx = df.columns.get_loc(h)
+                df.insert(idx + 1, f"{h}_blank", np.nan)
+        return df
+
+    def fill_stat_nans(df):
+        """Fill NaN only in numeric/stat columns (not blanks)."""
+        for col in df.columns:
+            if "_blank" not in col and col != "Tm":
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    df[col] = df[col].fillna(0)
+        return df
+
+    # ---------- offense ----------
+    if "passing" in book:
+        df = remove_avg_rows(book["passing"])
+        df = add_blank_cols(df, ["Cmp%", "Yds", "TD", "Int", "Y/A", "Rate", "Sk", "4QC", "GWD"])
+        book["passing"] = fill_stat_nans(df)
+
+    if "rushing" in book:
+        df = add_blank_cols(book["rushing"], ["Yds", "TD", "Y/A", "Fmb"])
+        book["rushing"] = fill_stat_nans(df)
+
+    if "total_off" in book:
+        df = add_blank_cols(book["total_off"], ["total_yards", "Y/P", "PF", "plays_per_drive", "yards_per_drive", "time_avg", "points_average"])
+        book["total_off"] = fill_stat_nans(df)
+
+    if "turnovers" in book:
+        df = book["turnovers"]
+        # find the turnovers column dynamically
+        if "turnovers" in df.columns:
+            idx = df.columns.get_loc("turnovers")
+            # blank after turnovers
+            df.insert(idx + 1, "blank1", np.nan)
+            # DEF_Turnovers right after blank
+            df.insert(idx + 2, "DEF_Turnovers", df["Tm"].map(def_turn_map).fillna(0))
+            # blank after DEF_Turnovers
+            df.insert(idx + 3, "blank2", np.nan)
+            book["turnovers"] = df.fillna(0)
+
+
+    if "penalties" in book:
+        df = book["penalties"].copy()
+
+    # remove leftover blanks
+        for c in [c for c in df.columns if "blank" in c]:
+            del df[c]
+
+        if "penalties" in df.columns and "penalty_yards" in df.columns:
+            p_idx = df.columns.get_loc("penalties")
+            y_idx = df.columns.get_loc("penalty_yards")
+
+        # penalties (C) → blank (D)
+            df.insert(p_idx + 1, "blank_D", np.nan)
+
+        # DEF_penalties (E)
+            df.insert(p_idx + 2, "DEF_penalties", df["Tm"].map(def_pen_map).fillna(0))
+
+        # blank (F)
+            df.insert(p_idx + 3, "blank_F", np.nan)
+
+        # DEF_penalty_yards (G)
+            df.insert(p_idx + 4, "DEF_penalty_yards", df["Tm"].map(def_pen_map).fillna(0))
+
+        # blank (H)
+            df.insert(p_idx + 5, "blank_H", np.nan)
+
+
+        # BLANK (J)
+            df.insert(p_idx + 7, "blank_J", np.nan)
+
+    book["penalties"] = fill_stat_nans(df)
+
+
+    # ---------- defense ----------
+    if "passing_d" in book:
+        df = remove_avg_rows(book["passing_d"])
+        df = add_blank_cols(df, ["Cmp%", "Yds", "TD", "Int", "Y/A", "Rate", "Sk", "QBHits"])
+        book["passing_d"] = fill_stat_nans(df)
+
+    if "rushing_d" in book:
+        df = remove_avg_rows(book["rushing_d"])
+        df = add_blank_cols(df, ["Yds", "TD", "Y/A"])
+        book["rushing_d"] = fill_stat_nans(df)
+
+    if "total_d" in book:
+        df = add_blank_cols(book["total_d"], ["total_yards", "Y/P", "PF", "plays_per_drive", "yards_per_drive", "time_avg", "points_average"])
+        book["total_d"] = fill_stat_nans(df)
+
+    with pd.ExcelWriter(out_path, engine="xlsxwriter") as w:
+        for name, df in book.items():
+            df.to_excel(w, index=False, sheet_name=name)
+
+    print("✅ lightweight formatting done")
+
+    # ---------- now insert formulas ----------
+    print("🧩 inserting rank formulas...")
+
+    add_rank_formulas(out_path, "passing",   high_cols=["Cmp%", "Yds", "TD", "Y/A", "Rate", "4QC", "GWD"], low_cols=["Int", "Sk"])
+    add_rank_formulas(out_path, "rushing",   high_cols=["Yds", "TD", "Y/A"], low_cols=["Fmb"])
+    add_rank_formulas(out_path, "total_off", high_cols=["total_yards", "Y/P", "PF", "plays_per_drive", "yards_per_drive", "time_avg", "points_average"])
+    add_rank_formulas(out_path, "turnovers", high_cols=["DEF_Turnovers"], low_cols=["turnovers"])
+    add_rank_formulas(out_path, "penalties", high_cols=["DEF_penalties","DEF_penalty_yards"], low_cols=["penalties", "penalty_yards"])
+    add_rank_formulas(out_path, "passing_d", low_cols=["Cmp%", "Yds", "TD", "Y/A", "Rate"], high_cols=["Int", "Sk"])
+    add_rank_formulas(out_path, "rushing_d", low_cols=["Yds", "TD", "Y/A"])
+    add_rank_formulas(out_path, "total_d",   low_cols=["total_yards", "Y/P", "PF", "plays_per_drive", "yards_per_drive", "time_avg", "points_average"])
+
+
+    # ---------- Add Total + Total_Rank columns to all sheets ----------
+
+    wb = load_workbook(out_path)
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        max_row = ws.max_row
+        max_col = ws.max_column
+
+        if max_row <= 1 or max_col <= 2:
+            continue  # skip empty or malformed sheets
+
+        # Default: use all *_blank columns
+        rank_cols = [
+            get_column_letter(c)
+            for c in range(2, max_col + 1)
+            if str(ws.cell(row=1, column=c).value or "").strip().lower().endswith("_blank")
+        ]
+
+        # Handle special cases (turnovers, penalties)
+        if sheet_name.lower() == "turnovers":
+            # Turnovers: low turnovers (C), high takeaways (E), high DEF_turnovers (G)
+            rank_cols = ["C", "E"]
+        elif sheet_name.lower() == "penalties":
+            # Penalties: low penalties (C), high DEF_penalties (E), high DEF_penalty_yards (G), low penalty_yards (I)
+            rank_cols = ["C", "E", "G", "I"]
+
+        if not rank_cols:
+            print(f"⚪ No rank columns found in {sheet_name}, skipping")
+            continue
+
+        # Add Total and Total_Rank columns after the last column
+        total_col = get_column_letter(ws.max_column + 1)
+        rank_col = get_column_letter(ws.max_column + 2)
+
+        ws[f"{total_col}1"] = "Total"
+        ws[f"{rank_col}1"] = "Total_Rank"
+
+        # Build SUM formula from identified rank columns
+        for r in range(2, max_row + 1):
+            sum_expr = "+".join([f"{col}{r}" for col in rank_cols])
+            ws[f"{total_col}{r}"] = f"={sum_expr}"
+
+        # Rank totals (low = best)
+        rank_range = f"${total_col}$2:${total_col}${max_row}"
+        for r in range(2, max_row + 1):
+            ws[f"{rank_col}{r}"] = f"=RANK({total_col}{r},{rank_range},1)"
+
+        print(f"✅ Added Total + Total_Rank to {sheet_name}")
+
+    wb.save(out_path)
+    wb.close()
+    print("✅ All sheets now have Total + Total_Rank columns.")
+
+    # ---------- Rebuild Turnovers Sheet Layout ----------
+    print("🧩 Rebuilding Turnovers sheet layout with diff and ranks...")
+
+
+    wb = load_workbook(out_path)
+    if "turnovers" in wb.sheetnames:
+        ws = wb["turnovers"]
+        max_row = ws.max_row
+
+        # Make sure we have at least columns A–I
+        if ws.max_column < 9:
+            ws.insert_cols(ws.max_column + 1, amount=(9 - ws.max_column))
+
+        # Update headers
+        ws["F1"] = "Turnover_Diff"
+        ws["G1"] = "Diff_Rank"
+        ws["H1"] = "Total"
+        ws["I1"] = "Total_Rank"
+
+        # Fill formulas row by row
+        for r in range(2, max_row + 1):
+            # F = D - B
+            ws[f"F{r}"] = f"=D{r}-B{r}"
+
+            # G = rank of F (high is good)
+            ws[f"G{r}"] = f"=RANK(F{r},$F$2:$F${max_row},0)"
+
+            # H = total of the three ranks (C, E, G)
+            ws[f"H{r}"] = f"=C{r}+E{r}+G{r}"
+
+            # I = rank of total (low is best)
+            ws[f"I{r}"] = f"=RANK(H{r},$H$2:$H${max_row},1)"
+
+        print("✅ Turnovers formulas applied (Diff, Diff_Rank, Total, Total_Rank).")
+
+    wb.save(out_path)
+    wb.close()
+
+
+    # ---------- FINAL: Build and Fill Totals Sheet ----------
+    print("🧩 Building and filling Totals sheet...")
+
+
+    book = pd.read_excel(out_path, sheet_name=None)
+    team_ranks = {}
+
+    # Which sheets to pull from and their label names
+    sheets_to_pull = [
+        ("passing", "Passing"),
+        ("rushing", "Rushing"),
+        ("total_off", "Total_Off"),
+        ("turnovers", "Turnovers"),
+        ("penalties", "Penalties"),
+        ("passing_d", "Pass_D"),
+        ("rushing_d", "Rush_D"),
+        ("total_d", "Total_D"),
+        ("records", "SRS"),
+    ]
+
+    # Helper: extract numeric Total_Rank column if it exists
+    for sheet_name, label in sheets_to_pull:
+        if sheet_name not in book:
+            print(f"⚠️ Missing sheet {sheet_name}, skipping.")
+            continue
+
+        df = book[sheet_name]
+        # find column by case-insensitive match
+        rank_col = [c for c in df.columns if str(c).strip().lower() == "total_rank"]
+        team_col = [c for c in df.columns if str(c).strip().lower() in ("team", "tm")]
+        if not rank_col or not team_col:
+            print(f"⚠️ No Total_Rank in {sheet_name}, skipping.")
+            continue
+
+        rank_col = rank_col[0]
+        team_col = team_col[0]
+        sub = df[[team_col, rank_col]].copy()
+        sub.columns = ["Team", label]
+        team_ranks[label] = sub
+
+    # merge all rank frames together
+    if not team_ranks:
+        print("⚠️ No rank columns found at all — creating empty totals sheet.")
+        totals_df = pd.DataFrame(columns=["Team","Overall_Total","Overall_Rank"])
+    else:
+        df_final = None
+        for label, sub in team_ranks.items():
+            if df_final is None:
+                df_final = sub
+            else:
+                df_final = pd.merge(df_final, sub, on="Team", how="outer")
+
+        # numeric conversions and totals
+        for c in df_final.columns:
+            if c != "Team":
+                df_final[c] = pd.to_numeric(df_final[c], errors="coerce").fillna(0)
+
+        df_final["Overall_Total"] = df_final.drop(columns=["Team"]).sum(axis=1)
+        df_final["Overall_Rank"] = df_final["Overall_Total"].rank(ascending=True, method="min").astype(int)
+        totals_df = df_final.sort_values(by="Overall_Rank").reset_index(drop=True)
+
+    # write to workbook
+    # write to workbook
+    with pd.ExcelWriter(out_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+        totals_df.to_excel(writer, index=False, sheet_name="totals")
+
+    print(f"✅ Totals sheet created successfully with {len(totals_df)} teams.")
+
+
+    print("🧩 Copying Total_Rank data from each sheet into existing 'totals' sheet...")
+
+    wb = load_workbook(out_path)
+    if "totals" not in wb.sheetnames:
+        print("⚠️ No totals sheet found — skipping copy.")
+    else:
+        ws_totals = wb["totals"]
+
+        # Build quick lookup: team -> row in totals sheet
+        team_col = 1
+        team_to_row = {}
+        for r in range(2, ws_totals.max_row + 1):
+            team = str(ws_totals.cell(row=r, column=team_col).value or "").strip()
+            if team:
+                team_to_row[team] = r
+
+        # Mapping of source sheets and their target column names
+        sheet_map = {
+            "passing": "Passing",
+            "rushing": "Rushing",
+            "total_off": "Total_Off",
+            "turnovers": "Turnovers",
+            "penalties": "Penalties",
+            "passing_d": "Pass_D",
+            "rushing_d": "Rush_D",
+            "total_d": "Total_D",
+        }
+
+        # Find header positions in totals sheet
+        header_to_col = {}
+        for c in range(1, ws_totals.max_column + 1):
+            val = str(ws_totals.cell(row=1, column=c).value or "").strip()
+            if val:
+                header_to_col[val] = c
+
+        # For each sheet, copy its Total_Rank into the corresponding column
+        for s_name, col_label in sheet_map.items():
+            if s_name not in wb.sheetnames or col_label not in header_to_col:
+                continue
+
+            ws_src = wb[s_name]
+            src_rank_col = None
+            for c in range(1, ws_src.max_column + 1):
+                v = str(ws_src.cell(row=1, column=c).value or "").strip().lower()
+                if v == "total_rank":
+                    src_rank_col = c
+                    break
+            if not src_rank_col:
+                print(f"⚠️ No Total_Rank found in {s_name}")
+                continue
+
+            dest_col = header_to_col[col_label]
+
+            for r in range(2, ws_src.max_row + 1):
+                team = str(ws_src.cell(row=r, column=1).value or "").strip()
+                rank_val = ws_src.cell(row=r, column=src_rank_col).value
+                if team in team_to_row and rank_val is not None:
+                    ws_totals.cell(row=team_to_row[team], column=dest_col).value = rank_val
+
+            print(f"✅ Copied Total_Rank from {s_name} to totals → {col_label}")
+
+        wb.save(out_path)
+        print("✅ All Total_Rank data successfully copied into totals sheet.")
+
+    wb.close()
+
+
+    # ✅ reload after writing totals to ensure it's saved correctly
+    wb = load_workbook(out_path)
+
+    if "totals" in wb.sheetnames:
+        print("🎨 Applying conditional formatting to totals sheet...")
+        from openpyxl.formatting.rule import ColorScaleRule
+        from openpyxl.styles import Font, Alignment
+
+        ws = wb["totals"]
+        max_row = ws.max_row
+        max_col = ws.max_column
+
+        # bold header
+        for c in range(1, max_col + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+
+        # apply color scale to ranks and totals
+        if max_col > 2:
+            data_range = f"B2:{get_column_letter(max_col)}{max_row}"
+            ws.conditional_formatting.add(
+                data_range,
+                ColorScaleRule(
+                    start_type="min", start_color="63BE7B",   # green
+                    mid_type="percentile", mid_value=50, mid_color="FFEB84",  # yellow
+                    end_type="max", end_color="F8696B"  # red
+                )
+            )
+            print("✅ Conditional formatting applied.")
+
+    # ---------- Build Records Sheet from Standings ----------
+    print("🧩 Extracting standings (win%, SOS, SRS) from offense HTML...")
+
+
+    standings_html = off_html.read_text(encoding="utf-8")
+    soup = BeautifulSoup(standings_html, "lxml")
+
+    records_data = []
+
+    for conf in ["AFC", "NFC"]:
+        table = soup.select_one(f"table#{conf}")
+        if not table:
+            continue
+
+        for tr in table.select("tbody tr"):
+            team_cell = tr.find("th", {"data-stat": "team"})
+            if not team_cell:
+                continue
+
+            team = team_cell.get_text(strip=True)
+            if not team or "Team" in team:
+                continue
+
+            def safe_num(stat):
+                el = tr.find("td", {"data-stat": stat})
+                if not el:
+                    return 0.0
+                txt = el.get_text(strip=True).replace("−", "-")
+                if txt.startswith("."):
+                    txt = "0" + txt
+                try:
+                    return float(txt)
+                except:
+                    return 0.0
+
+            record = {
+                "Team": re.sub(r"[*+]", "", team).strip(),
+                "Win%": safe_num("win_loss_perc"),
+                "SOS": safe_num("sos_total"),
+                "SRS": safe_num("srs_total"),
+            }
+            records_data.append(record)
+
+    if not records_data:
+        print("⚠️ No standings data found in offense HTML.")
+    else:
+        df_records = pd.DataFrame(records_data)
+        df_records["Team"] = (
+            df_records["Team"].str.replace(r"\s+", " ", regex=True).str.strip()
+        )
+        df_records = df_records.sort_values(by="Team").reset_index(drop=True)
+
+        # ranks: high Win% and high SOS are good
+        df_records["Win%_Rank"] = (
+            df_records["Win%"].rank(ascending=False, method="min").astype(int)
+        )
+        df_records["SOS_Rank"] = (
+            df_records["SOS"].rank(ascending=False, method="min").astype(int)
+        )
+
+        # total (sum of ranks)
+        df_records["Total"] = df_records["Win%_Rank"] + df_records["SOS_Rank"]
+
+        # total rank (low total is best)
+        df_records["Total_Rank"] = (
+            df_records["Total"].rank(ascending=True, method="min").astype(int)
+        )
+
+        print("✅ Standings parsed and ranked; writing Records sheet...")
+
+        with pd.ExcelWriter(
+            out_path, engine="openpyxl", mode="a", if_sheet_exists="replace"
+        ) as writer:
+            df_records.to_excel(writer, index=False, sheet_name="records")
+
+        print("✅ Records sheet created with Win%, SOS, SRS, Total, and Total_Rank columns.")
+
+    print("🧩 Building totals sheet dynamically using direct RANK references...")
+
+    wb = load_workbook(out_path)
+
+    # Remove any old totals sheet
+    if "totals" in wb.sheetnames:
+        wb.remove(wb["totals"])
+    ws_totals = wb.create_sheet("totals")
+
+    # Header row
+    headers = [
+        "Team",  "Records", "Passing", "Rushing", "Total_Off", "Turnovers",
+        "Penalties", "Pass_D", "Rush_D", "Total_D", "Rank", "Total"
+    ]
+    for i, h in enumerate(headers, start=1):
+        ws_totals.cell(row=1, column=i).value = h
+
+    # Detect team count from passing sheet
+    if "passing" in wb.sheetnames:
+        ws_pass = wb["passing"]
+        num_teams = ws_pass.max_row - 1
+    else:
+        num_teams = 32
+
+    # Copy team names
+    for r in range(2, num_teams + 2):
+        ws_totals[f"A{r}"] = f"=passing!A{r}"
+
+    # RANK source map: destination_col -> (sheet_name, column_letter, order)
+    rank_sources = {
+        "B": ("records", "G", 1),
+        "C": ("passing", "V", 32),
+        "D": ("rushing", "K", 1),
+        "E": ("total_off", "N", 1),
+        "F": ("turnovers", "H", 1),
+        "G": ("penalties", "J", 1),
+        "H": ("passing_d", "T", 1),
+        "I": ("rushing_d", "J", 1),
+        "J": ("total_d", "N", 1),
+    }
+
+    # Fill formulas for B–J using explicit sheet references
+    for dest_col, (sheet, src_col, rank_order) in rank_sources.items():
+        for r in range(2, num_teams + 2):
+            ws_totals[f"{dest_col}{r}"] = (
+                f"=RANK({sheet}!{src_col}{r},"
+                f"{sheet}!{src_col}$2:{src_col}$33,{rank_order})"
+            )
+        print(f"✅ totals!{dest_col} → RANK({sheet}!{src_col}...)")
+
+    # Column L = SUM(B:J)
+    for r in range(2, num_teams + 2):
+        ws_totals[f"L{r}"] = f"=SUM(B{r}:J{r})"
+
+    # Column K = RANK of L (low = good)
+    rank_range = f"$L$2:$L${num_teams + 1}"
+    for r in range(2, num_teams + 2):
+        ws_totals[f"K{r}"] = f"=RANK(L{r},{rank_range},1)"
+
+    print("✅ Totals sheet built with proper cross-sheet RANK formulas.")
+
+    wb.save(out_path)
+    wb.close()
+
+    print("✅ Totals sheet finalized and saved!")
+    print(f"✅ wrote {out_path}")
+
+    # ---------- FINAL: Merge full betsheet{week}.xlsx into main workbook ----------
+    print(f"🧩 Merging betsheet{args.week}.xlsx → {out_path}")
+
+    betsheet_src = Path(f"betsheet{args.week}.xlsx")
+    main_xlsx = out_path  # your generated file (e.g. NFL_25_7/data/week7-all25.xlsx)
+
+    if not betsheet_src.exists():
+        print(f"⚠️ Missing betsheet{args.week}.xlsx — cannot merge betsheet.")
+    else:
+        # Load both workbooks
+        wb_main = load_workbook(main_xlsx)
+        wb_bet = load_workbook(betsheet_src, data_only=False)  # preserve formulas
+
+        # Ensure no name conflict
+        bet_sheetname = f"betsheet{args.week}"
+        if bet_sheetname in wb_main.sheetnames:
+            del wb_main[bet_sheetname]
+
+        # Get first (and only) sheet from betsheetX.xlsx
+        ws_source = wb_bet.worksheets[0]
+        ws_dest = wb_main.create_sheet(bet_sheetname)
+
+        # Copy cell values + formatting
+        for r_idx, row in enumerate(ws_source.iter_rows(), start=1):
+            for c_idx, cell in enumerate(row, start=1):
+                dest_cell = ws_dest.cell(row=r_idx, column=c_idx, value=cell.value)
+                if cell.has_style:
+                    try:
+                        dest_cell.font = copy(cell.font)
+                        dest_cell.border = copy(cell.border)
+                        dest_cell.fill = copy(cell.fill)
+                        dest_cell.number_format = cell.number_format
+                        dest_cell.protection = copy(cell.protection)
+                        dest_cell.alignment = copy(cell.alignment)
+                    except Exception:
+                        pass
+
+        # Preserve dimensions
+        for col_idx, col_dim in ws_source.column_dimensions.items():
+            try:
+                ws_dest.column_dimensions[col_idx].width = col_dim.width
+            except Exception:
+                pass
+
+        for row_idx, row_dim in ws_source.row_dimensions.items():
+            try:
+                ws_dest.row_dimensions[row_idx].height = row_dim.height
+            except Exception:
+                pass
+
+        print("🧩 Filling betsheet from totals (B2:L33) if totals sheet exists...")
+
+        if "totals" not in wb_main.sheetnames:
+            print("⚠️ No 'totals' sheet found — cannot populate betsheet.")
+        else:
+            ws_bet = wb_main[bet_sheetname]
+            ws_totals = wb_main["totals"]
+
+            # Copy B2:L33 (values + formulas)
+            for r in range(2, 34):   # rows 2–33
+                for c in range(2, 13):  # columns B–L
+                    src = ws_totals.cell(row=r, column=c)
+                    dest = ws_bet.cell(row=r, column=c)
+                    dest.value = src.value
+
+            print(f"✅ Copied totals!B2:L33 → {bet_sheetname}!B2:L33 successfully.")
+
+        wb_main.save(main_xlsx)
+        wb_main.close()
+        wb_bet.close()
+
+        print(f"✅ Merged betsheet{args.week}.xlsx as sheet '{bet_sheetname}' into {main_xlsx.name}")
+
+if __name__ == "__main__":
+    main()
+
+
